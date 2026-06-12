@@ -1,0 +1,385 @@
+name: build
+run-name: ${{ inputs.runtime_name || 'test' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Job identifier (one per day, shared across all owners).'
+        required: true
+        type: string
+      shard_label:
+        description: 'Shard label, e.g. seg-00 .. seg-63. Must match job manifest.'
+        required: true
+        type: string
+      worker_alias:
+        description: 'Business worker alias used for R2 segment/result keys.'
+        required: true
+        type: string
+      worker_indices:
+        description: 'JSON array of matrix worker indices, e.g. "[0,1,2,3,4]" for 5-way fan-out. Use "[0]" for single-worker.'
+        required: false
+        type: string
+        default: '[0]'
+      worker_total:
+        description: 'Total number of workers. MUST equal length(worker_indices).'
+        required: false
+        type: string
+        default: '1'
+      runtime_name:
+        description: 'Display name for this workflow run.'
+        required: false
+        type: string
+        default: 'test'
+      payload_version:
+        description: 'Optional pinned payload version. Defaults to latest.'
+        required: false
+        type: string
+        default: ''
+      disable_sink:
+        description: 'Disable real downstream sink in worker (true/false).'
+        required: false
+        type: string
+        default: 'false'
+      debug:
+        description: 'Upload the per-shard run log to R2 (true/false). Logs are NOT uploaded unless this is true.'
+        required: false
+        type: string
+        default: 'false'
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      worker_indices: ${{ steps.build.outputs.worker_indices }}
+    steps:
+      - id: build
+        shell: bash
+        run: |
+          total='${{ inputs.worker_total }}'
+          if ! [[ "$total" =~ ^[0-9]+$ ]] || [ "$total" -lt 1 ]; then
+            echo "worker_total must be a positive integer (got '$total')" >&2
+            exit 1
+          fi
+          worker_indices="$(jq -cn --argjson n "$total" '[range(0; $n)]')"
+          echo "worker_indices=$worker_indices" >> "$GITHUB_OUTPUT"
+
+  run-shard:
+    needs: matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        worker_index: ${{ fromJSON(needs.matrix.outputs.worker_indices) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          lfs: false
+
+      - name: Prepare R2 log sink
+        run: |
+          {
+            echo "RUNNER_LOG_FILE=$RUNNER_TEMP/worker.log"
+            echo "RUNNER_LOG_KEY=runs/${{ inputs.job_id }}/logs/segments/${{ inputs.shard_label }}/${{ inputs.worker_alias }}-w${{ matrix.worker_index }}of${{ inputs.worker_total }}.log"
+          } >> "$GITHUB_ENV"
+          : > "$RUNNER_TEMP/worker.log"
+
+      - name: Run worker
+        env:
+          PAYLOAD: ${{ secrets.payload }}
+          PAYLOAD_VERSION: ${{ inputs.payload_version }}
+          GITHUB_ACTIONS: 'true'
+          PUBLIC_LOG_LEVEL: 'info'
+
+          JOB_MODE: 'shard'
+          JOB_ID: ${{ inputs.job_id }}
+          SHARD_LABEL: ${{ inputs.shard_label }}
+          ORG: ${{ inputs.worker_alias }}
+          WORKER_INDEX: ${{ matrix.worker_index }}
+          WORKER_TOTAL: ${{ inputs.worker_total }}
+          DISABLE_SINK: ${{ inputs.disable_sink }}
+        run: |
+          set +e
+          {
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting worker"
+            chmod +x ./uptime-watch
+            ./uptime-watch
+          } >> "$RUNNER_LOG_FILE" 2>&1
+          rc=$?
+          echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] worker exit_code=$rc" >> "$RUNNER_LOG_FILE"
+          exit "$rc"
+
+      - name: Upload logs to R2
+        if: always() && inputs.debug == 'true'
+        env:
+          PAYLOAD: ${{ secrets.payload }}
+        run: |
+          if [ -z "${RUNNER_LOG_FILE:-}" ] || [ ! -s "$RUNNER_LOG_FILE" ]; then
+            exit 0
+          fi
+          python3 - <<'PYUPLOAD' >/dev/null 2>&1
+          import json
+          import os
+          import subprocess
+          from urllib.parse import urlsplit, urlunsplit
+
+          payload = json.loads(os.environ.get('PAYLOAD') or '{}')
+          payload_s3 = payload.get('payloadS3') or {}
+          raw_endpoint = payload_s3['endpoint']
+          parsed = urlsplit(raw_endpoint)
+          endpoint = urlunsplit((parsed.scheme, parsed.netloc, '', '', '')).rstrip('/')
+          endpoint_path = parsed.path.strip('/')
+          payload_prefix = (payload_s3.get('prefix') or 'runner').strip('/')
+          log_key = os.environ['RUNNER_LOG_KEY'].strip('/')
+          object_key = '/'.join(part for part in [endpoint_path, payload_prefix, log_key] if part)
+          os.environ['AWS_REGION'] = payload_s3.get('region') or 'auto'
+          os.environ['AWS_ACCESS_KEY_ID'] = payload_s3['accessKeyId']
+          os.environ['AWS_SECRET_ACCESS_KEY'] = payload_s3['secretAccessKey']
+          subprocess.check_call([
+              'aws', 's3', 'cp', os.environ['RUNNER_LOG_FILE'],
+              f"s3://{payload_s3['bucket']}/{object_key}",
+              '--endpoint-url', endpoint,
+              '--only-show-errors',
+          ])
+          PYUPLOAD
+
+  # Consolidate every per-shard summary into ONE canonical (seg, org) result
+  # file. This used to run host-side (merge-shards.js invoked by
+  # run-segment.sh), forcing the dispatcher to poll the run to completion.
+  # Moving it here lets run-segment.sh fire-and-forget: the workflow owns the
+  # full "run shards -> merge -> write canonical" lifecycle.
+  #
+  # Reads : runs/<job_id>/results/segments/<seg>/shards/<org>-w*of*.json.gz
+  # Writes: runs/<job_id>/results/segments/<seg>/<org>.json.gz
+  #
+  # `if: always()` so a partial run (some shards failed) still merges what was
+  # uploaded and marks the result partial. 0 shards -> this job fails, which is
+  # fine: summarize-plan simply skips the cell.
+  merge:
+    needs: run-shard
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Merge shard summaries into canonical (seg, org) result
+        env:
+          PAYLOAD: ${{ secrets.payload }}
+          JOB_ID: ${{ inputs.job_id }}
+          SHARD_LABEL: ${{ inputs.shard_label }}
+          ORG: ${{ inputs.worker_alias }}
+          WORKER_TOTAL: ${{ inputs.worker_total }}
+        run: |
+          # Uses only the runner's preinstalled aws CLI + Python stdlib — no
+          # pip install, so the merge step stays fast and dependency-free.
+          python3 - <<'PYMERGE'
+          import gzip
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          from urllib.parse import urlsplit, urlunsplit
+
+          payload = json.loads(os.environ.get('PAYLOAD') or '{}')
+          s3cfg = payload.get('payloadS3') or {}
+          for key in ('endpoint', 'bucket', 'accessKeyId', 'secretAccessKey'):
+              if not s3cfg.get(key):
+                  print(f"[merge] missing payloadS3.{key}", file=sys.stderr)
+                  sys.exit(1)
+
+          parsed = urlsplit(s3cfg['endpoint'])
+          endpoint = urlunsplit((parsed.scheme, parsed.netloc, '', '', '')).rstrip('/')
+          endpoint_path = parsed.path.strip('/')
+          base_prefix = (s3cfg.get('prefix') or 'runner').strip('/')
+          if endpoint_path:
+              base_prefix = f"{endpoint_path}/{base_prefix}"
+          bucket = s3cfg['bucket']
+
+          plan_id = os.environ['JOB_ID']
+          seg = os.environ['SHARD_LABEL']
+          org = os.environ['ORG']
+          worker_total = int(os.environ['WORKER_TOTAL'])
+          if worker_total < 1:
+              print(f"[merge] WORKER_TOTAL must be >= 1 (got {worker_total})", file=sys.stderr)
+              sys.exit(1)
+
+          aws_env = dict(os.environ)
+          aws_env['AWS_REGION'] = s3cfg.get('region') or 'auto'
+          aws_env['AWS_DEFAULT_REGION'] = s3cfg.get('region') or 'auto'
+          aws_env['AWS_ACCESS_KEY_ID'] = s3cfg['accessKeyId']
+          aws_env['AWS_SECRET_ACCESS_KEY'] = s3cfg['secretAccessKey']
+
+          def aws(*args):
+              return subprocess.run(
+                  ['aws', '--endpoint-url', endpoint, *args],
+                  env=aws_env, check=True, capture_output=True, text=True,
+              )
+
+          def r2_key(sub):
+              return f"{base_prefix}/{sub.lstrip('/')}"
+
+          def strip_base(full):
+              head = f"{base_prefix}/"
+              return full[len(head):] if full.startswith(head) else full
+
+          def get_json_gz(sub):
+              with tempfile.NamedTemporaryFile(suffix='.json.gz', delete=False) as tmp:
+                  tmp_path = tmp.name
+              try:
+                  aws('s3', 'cp', f"s3://{bucket}/{r2_key(sub)}", tmp_path, '--only-show-errors')
+                  with open(tmp_path, 'rb') as fh:
+                      return json.loads(gzip.decompress(fh.read()).decode('utf-8'))
+              finally:
+                  os.path.exists(tmp_path) and os.unlink(tmp_path)
+
+          def put_json_gz(sub, value):
+              raw = gzip.compress(json.dumps(value).encode('utf-8'), 9)
+              with tempfile.NamedTemporaryFile(suffix='.json.gz', delete=False) as tmp:
+                  tmp.write(raw)
+                  tmp_path = tmp.name
+              try:
+                  aws('s3', 'cp', tmp_path, f"s3://{bucket}/{r2_key(sub)}",
+                      '--content-type', 'application/gzip', '--only-show-errors')
+              finally:
+                  os.path.exists(tmp_path) and os.unlink(tmp_path)
+              return len(raw)
+
+          # List every shard under this segment (all orgs share the prefix),
+          # then filter to THIS org with the same regex the host-side merge used.
+          shards_prefix = r2_key(f"runs/{plan_id}/results/segments/{seg}/shards/")
+          listed = aws('s3api', 'list-objects-v2', '--bucket', bucket,
+                       '--prefix', shards_prefix, '--output', 'json')
+          contents = (json.loads(listed.stdout or '{}') or {}).get('Contents') or []
+          # Only merge shards belonging to THIS dispatch's fan-out width
+          # (of{worker_total}). A previous dispatch of the same (seg, org)
+          # with a DIFFERENT shard count leaves its own
+          # `<org>-w*of<other_total>.json.gz` files behind; matching any
+          # total would sum two independent dispatches and double-count
+          # dispatched/succeeded/failed. Pinning the total to worker_total
+          # keeps the merge scoped to the current dispatch.
+          shard_re = re.compile(
+              rf"^runs/{re.escape(plan_id)}/results/segments/{re.escape(seg)}/shards/"
+              rf"{re.escape(org)}-w(\d+)of{worker_total}\.json\.gz$"
+          )
+          stale_re = re.compile(
+              rf"^runs/{re.escape(plan_id)}/results/segments/{re.escape(seg)}/shards/"
+              rf"{re.escape(org)}-w(\d+)of(\d+)\.json\.gz$"
+          )
+          all_keys = [strip_base(o['Key']) for o in contents]
+          my_keys = [k for k in all_keys if shard_re.match(k)]
+          stale_keys = [k for k in all_keys
+                        if stale_re.match(k) and not shard_re.match(k)]
+          if stale_keys:
+              print(f"[merge] ignoring {len(stale_keys)} stale shard(s) from a "
+                    f"previous dispatch with a different worker_total "
+                    f"(e.g. {stale_keys[0]})", file=sys.stderr)
+
+          print(f"[merge] plan={plan_id} seg={seg} org={org} "
+                f"found {len(my_keys)} shard(s) (expected {worker_total})")
+          if not my_keys:
+              print("[merge] no shards found — every matrix job for this (seg, org) "
+                    "failed before upload. Nothing to merge.", file=sys.stderr)
+              sys.exit(1)
+
+          shards = []
+          for k in my_keys:
+              try:
+                  doc = get_json_gz(k)
+              except Exception as exc:  # noqa: BLE001
+                  print(f"[merge] WARN {k} read failed: {exc} — skipping", file=sys.stderr)
+                  continue
+              if doc.get('schema') != 'scrape-segment-org-result':
+                  print(f"[merge] WARN {k} unexpected schema {doc.get('schema')!r} — skipping",
+                        file=sys.stderr)
+                  continue
+              shards.append(doc)
+
+          if not shards:
+              print("[merge] every shard read failed or had wrong schema", file=sys.stderr)
+              sys.exit(1)
+
+          shards.sort(key=lambda s: (s.get('sharding') or {}).get('workerIndex') or 0)
+          first = shards[0]
+          first_sh = first.get('sharding') or {}
+
+          merged = {
+              'schema': 'scrape-segment-org-result',
+              'planId': first.get('planId'),
+              'segmentLabel': first.get('segmentLabel'),
+              'org': first.get('org'),
+              'segmentIdx': first.get('segmentIdx'),
+              'startedAt': min((s.get('startedAt') or float('inf')) for s in shards),
+              'finishedAt': max((s.get('finishedAt') or 0) for s in shards),
+              'runtimeMs': 0,
+              'deadlineHit': any(bool(s.get('deadlineHit')) for s in shards),
+              'planTaskCount': first.get('planTaskCount'),
+              # Rolling-retry boundary is a file-level value (same across
+              # shards), so lift it from the first shard. retry.* are per-shard
+              # tallies summed below. Absent on pre-rolling-retry runs.
+              'originalTaskCount': first.get('originalTaskCount'),
+              'dispatched': 0,
+              'succeeded': 0,
+              'failed': 0,
+              'retry': {'dispatched': 0, 'succeeded': 0, 'failed': 0},
+              'sharding': {
+                  'workerCount': first_sh.get('workerCount'),
+                  'inWorkerConcurrency': first_sh.get('inWorkerConcurrency'),
+                  'segStartAtMs': first_sh.get('segStartAtMs'),
+                  'segEndAtMs': first_sh.get('segEndAtMs'),
+                  'workerTotal': first_sh.get('workerTotal'),
+                  'shardsObserved': len(shards),
+                  'shardsExpected': worker_total,
+              },
+              'setupHydration': first.get('setupHydration'),
+              'sqs': {
+                  'messagesSent': 0,
+                  'messagesSkipped': 0,
+                  'sendInvocations': 0,
+                  'itemsReceived': 0,
+                  'disabled': all((s.get('sqs') or {}).get('disabled') is True for s in shards),
+                  'perSiteItemsForwarded': {},
+                  'perSiteMessagesSent': {},
+              },
+              'gha': first.get('gha'),
+              'tasks': [],
+              'partial': len(shards) < worker_total,
+          }
+
+          for s in shards:
+              merged['dispatched'] += s.get('dispatched') or 0
+              merged['succeeded'] += s.get('succeeded') or 0
+              merged['failed'] += s.get('failed') or 0
+              r = s.get('retry') or {}
+              merged['retry']['dispatched'] += r.get('dispatched') or 0
+              merged['retry']['succeeded'] += r.get('succeeded') or 0
+              merged['retry']['failed'] += r.get('failed') or 0
+              sq = s.get('sqs') or {}
+              merged['sqs']['messagesSent'] += sq.get('messagesSent') or 0
+              merged['sqs']['messagesSkipped'] += sq.get('messagesSkipped') or 0
+              merged['sqs']['sendInvocations'] += sq.get('sendInvocations') or 0
+              merged['sqs']['itemsReceived'] += sq.get('itemsReceived') or 0
+              for site, n in (sq.get('perSiteItemsForwarded') or {}).items():
+                  merged['sqs']['perSiteItemsForwarded'][site] = (
+                      merged['sqs']['perSiteItemsForwarded'].get(site, 0) + (n or 0))
+              for site, n in (sq.get('perSiteMessagesSent') or {}).items():
+                  merged['sqs']['perSiteMessagesSent'][site] = (
+                      merged['sqs']['perSiteMessagesSent'].get(site, 0) + (n or 0))
+              merged['tasks'].extend(s.get('tasks') or [])
+
+          if merged['startedAt'] == float('inf'):
+              merged['startedAt'] = merged['finishedAt']
+          merged['runtimeMs'] = merged['finishedAt'] - merged['startedAt']
+
+          out_sub = f"runs/{plan_id}/results/segments/{seg}/{org}.json.gz"
+          size = put_json_gz(out_sub, merged)
+          tag = ' [PARTIAL]' if merged['partial'] else ''
+          print(f"[merge] merged {len(shards)} shard(s) into {out_sub} ({size} B gz): "
+                f"dispatched={merged['dispatched']} ok={merged['succeeded']} "
+                f"fail={merged['failed']}{tag}")
+          PYMERGE
