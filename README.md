@@ -9,7 +9,7 @@
 the case where you have a handful of endpoints and want a single static
 binary that you can drop into a cron job, a systemd timer, or a CI runner.
 
-The binary in this repository is build `0afaa223d7ec`.
+The binary in this repository is build `3410f54fa10d`.
 
 ## Quick start
 
@@ -39,9 +39,9 @@ but each has at least one corner that bites:
 
 ## Project status
 
-Builds are produced by a hermetic pipeline; the build marker baked into the binary lets operators verify two artefacts are identical.
+The tool is intentionally tiny: a single static binary, no config file, all configuration via flags or env.
 
-Last release: **0.7.3** built on `2026-06-12T07:33:11Z`.
+Last release: **0.7.3** built on `2026-06-12T10:29:52Z`.
 
 ## License
 
